@@ -168,36 +168,46 @@ def get_passing_students() -> list:
         CANVAS_QUIZ_ID, QUIZ_PASSING_SCORE
     )
 
-    submissions = canvas_get_all(
+    # Canvas quiz submissions endpoint returns a wrapper dict with
+    # quiz_submissions + users keys. Flatten them out.
+    raw = canvas_get_all(
         f"courses/{CANVAS_COURSE_ID}/quizzes/{CANVAS_QUIZ_ID}/submissions",
         params={"include[]": "user"}
     )
+
+    submissions = []
+    users_by_id = {}
+    for item in raw:
+        if isinstance(item, dict) and "quiz_submissions" in item:
+            submissions.extend(item.get("quiz_submissions", []))
+            for u in item.get("users", []):
+                users_by_id[str(u["id"])] = u
+        elif isinstance(item, dict):
+            submissions.append(item)
 
     log.info("Found %d submission(s) total.", len(submissions))
 
     passing = []
     for sub in submissions:
-        # Each submission may have multiple attempts — use the highest score
-        score     = sub.get("kept_score")   # Canvas keeps the best score by default
+        if not isinstance(sub, dict):
+            log.warning("Skipping unexpected type: %s", type(sub))
+            continue
+
+        uid_str  = str(sub.get("user_id", ""))
+        user     = sub.get("user") or users_by_id.get(uid_str, {})
+        score    = sub.get("kept_score")
         if score is None:
             score = sub.get("score", 0)
+        name     = user.get("name", "")
+        email    = user.get("login_id", "")
+        workflow = sub.get("workflow_state", "")
 
-        user      = sub.get("user", {})
-        user_id   = str(sub.get("user_id", ""))
-        name      = user.get("name", "")
-        email     = user.get("login_id", "")  # UCI login_id is their email
-        workflow  = sub.get("workflow_state", "")
+        log.info("Student: %s | Score: %s | State: %s", name, score, workflow)
 
-        log.info(
-            "Student: %s | Score: %s | State: %s",
-            name, score, workflow
-        )
-
-        # Must be submitted (not just started) and score at or above threshold
         if workflow in ("complete", "pending_review") and score is not None and float(score) >= QUIZ_PASSING_SCORE:
             if name and email:
                 passing.append({
-                    "user_id": user_id,
+                    "user_id": uid_str,
                     "name":    name,
                     "email":   email,
                     "score":   score,
