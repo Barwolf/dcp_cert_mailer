@@ -4,21 +4,14 @@ CertMailer — Daily polling version
 Checks Canvas once a day for newly completed students and emails them
 their certificate. No webhook or admin access required.
 
-Requirements:
-    pip install -r requirements.txt
-
 Environment variables (set in Railway):
     CANVAS_URL          e.g. https://canvas.eee.uci.edu
     CANVAS_TOKEN        Canvas API token
-    CANVAS_COURSE_ID    The numeric ID of your course (see below)
+    CANVAS_COURSE_ID    Numeric course ID from the Canvas URL
     MAILGUN_API_KEY     Mailgun API key
     MAILGUN_DOMAIN      e.g. sandbox-abc123.mailgun.org
     FROM_EMAIL          Your verified sender email
     CERT_IMAGE_PATH     e.g. VCA_Cert_2026.png
-
-How to find your CANVAS_COURSE_ID:
-    Go to your course in Canvas — the number in the URL is the course ID.
-    e.g. canvas.eee.uci.edu/courses/12345  →  CANVAS_COURSE_ID=12345
 """
 
 import os
@@ -50,15 +43,13 @@ MAILGUN_DOMAIN   = os.environ["MAILGUN_DOMAIN"]
 FROM_EMAIL       = os.environ["FROM_EMAIL"]
 CERT_IMAGE_PATH  = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
 
-# Name position — adjust to match your certificate template.
-# Use the HTML tool to find the right X/Y percentages first.
 NAME_X_PCT  = 0.50
-NAME_Y_PCT  = 0.58
-NAME_SIZE   = 72
+NAME_Y_PCT  = 0.63
+NAME_SIZE   = 80
 NAME_COLOR  = (30, 26, 22)
 
-DB_PATH      = "cert_log.db"
-POLL_HOURS   = 24   # how often to check Canvas (in hours)
+DB_PATH    = "cert_log.db"
+POLL_HOURS = 24
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -112,10 +103,11 @@ def get_sent_log() -> list:
     return [{"name": r[0], "email": r[1], "sent_at": r[2]} for r in rows]
 
 # ---------------------------------------------------------------------------
-# Canvas API
+# Canvas API helpers
 # ---------------------------------------------------------------------------
 
-def canvas_get(path: str, params: dict = None) -> dict | list:
+def canvas_get(path: str, params: dict = None) -> dict:
+    """Single GET — for endpoints returning a single object (dict)."""
     resp = requests.get(
         f"{CANVAS_URL}/api/v1/{path}",
         headers={"Authorization": f"Bearer {CANVAS_TOKEN}"},
@@ -125,102 +117,90 @@ def canvas_get(path: str, params: dict = None) -> dict | list:
     resp.raise_for_status()
     return resp.json()
 
+def canvas_get_all(path: str, params: dict = None) -> list:
+    """
+    Paginated GET — follows Canvas Link header pagination to fetch all results.
+    UCI Canvas uses Link headers, not page= parameters.
+    """
+    results = []
+    url = f"{CANVAS_URL}/api/v1/{path}"
+    next_params = dict(params or {})
+    next_params.setdefault("per_page", 100)
+
+    while url:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {CANVAS_TOKEN}"},
+            params=next_params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results.extend(resp.json())
+
+        # After first request, next URL already has params encoded
+        next_params = {}
+        url = None
+        for part in resp.headers.get("Link", "").split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<>")
+                break
+
+    return results
+
+# ---------------------------------------------------------------------------
+# Canvas business logic
+# ---------------------------------------------------------------------------
+
 def get_course_name() -> str:
     course = canvas_get(f"courses/{CANVAS_COURSE_ID}")
     return course.get("name", "your course")
 
 def get_all_modules() -> list:
-    """Return all modules in the course."""
-    modules = []
-    page = 1
-    while True:
-        batch = canvas_get(
-            f"courses/{CANVAS_COURSE_ID}/modules",
-            params={"per_page": 100, "page": page}
-        )
-        if not batch:
-            break
-        modules.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return modules
+    return canvas_get_all(f"courses/{CANVAS_COURSE_ID}/modules")
 
 def student_completed_all_modules(user_id: str, modules: list) -> bool:
-    """
-    Check if a student has completed all modules by looking at
-    each module's completion_requirement for that student.
-    Uses the include[]=student_completions param.
-    """
+    """Returns True if the student has completed every module that has requirements."""
     for module in modules:
         module_id = module.get("id")
-        # Skip modules with no completion requirements
         if not module.get("completion_requirements"):
-            continue
+            continue  # skip modules with no requirements
         try:
             detail = canvas_get(
                 f"courses/{CANVAS_COURSE_ID}/modules/{module_id}",
                 params={"student_id": user_id}
             )
-            state = detail.get("state", "")
-            # state is 'completed' when all requirements in the module are done
-            if state != "completed":
+            if detail.get("state", "") != "completed":
                 return False
         except requests.HTTPError:
             return False
     return True
 
 def get_completed_students() -> list:
-    """
-    Returns a list of students who have completed all course modules.
-    Uses module state per student, which is supported on UCI Canvas.
-    """
-    students = []
-    page = 1
-
-    # Get all modules once upfront
+    """Returns all students who have completed all course modules."""
     modules = get_all_modules()
     if not modules:
-        log.warning("No modules found for course %s — nothing to check.", CANVAS_COURSE_ID)
+        log.warning("No modules found for course %s.", CANVAS_COURSE_ID)
         return []
-
     log.info("Found %d module(s) to check.", len(modules))
 
-    while True:
-        enrollments = canvas_get(
-            f"courses/{CANVAS_COURSE_ID}/enrollments",
-            params={
-                "type[]": "StudentEnrollment",
-                "state[]": "active",
-                "per_page": 100,
-                "page": page,
-            }
-        )
+    enrollments = canvas_get_all(
+        f"courses/{CANVAS_COURSE_ID}/enrollments",
+        params={"type[]": "StudentEnrollment", "state[]": "active"}
+    )
+    log.info("Checking %d enrolled student(s).", len(enrollments))
 
-        if not enrollments:
-            break
-
-        for enrollment in enrollments:
-            user_id = enrollment.get("user_id")
-            user    = enrollment.get("user", {})
-            name    = user.get("name", "")
-            email   = user.get("login_id", "")
-
-            try:
-                if student_completed_all_modules(str(user_id), modules) and name and email:
-                    students.append({
-                        "user_id": str(user_id),
-                        "name":    name,
-                        "email":   email,
-                    })
-
-            except requests.HTTPError as e:
-                log.warning("Could not get progress for user %s: %s", user_id, e)
-                continue
-
-        if len(enrollments) < 100:
-            break
-        page += 1
+    students = []
+    for enrollment in enrollments:
+        user_id = enrollment.get("user_id")
+        user    = enrollment.get("user", {})
+        name    = user.get("name", "")
+        email   = user.get("login_id", "")
+        try:
+            if name and email and student_completed_all_modules(str(user_id), modules):
+                students.append({"user_id": str(user_id), "name": name, "email": email})
+                log.info("Completed: %s", name)
+        except Exception as e:
+            log.warning("Could not check user %s: %s", user_id, e)
 
     return students
 
@@ -230,15 +210,15 @@ def get_completed_students() -> list:
 
 def load_font(size: int):
     candidates = [
+        "palatino.ttf",
         "georgia.ttf",
         "/usr/share/fonts/truetype/msttcorefonts/Georgia.ttf",
         "/Library/Fonts/Georgia.ttf",
-        "C:/Windows/Fonts/georgia.ttf",
     ]
     for path in candidates:
         if Path(path).exists():
             return ImageFont.truetype(path, size)
-    log.warning("Georgia not found — using default font. Add georgia.ttf to your repo.")
+    log.warning("No font file found — using PIL default. Add palatino.ttf to your repo.")
     return ImageFont.load_default()
 
 def generate_cert_pdf(student_name: str) -> bytes:
@@ -304,14 +284,13 @@ def send_cert_email(to_email: str, student_name: str, course_name: str, pdf_byte
         timeout=15,
     )
     response.raise_for_status()
-    log.info("Email sent to %s — Mailgun status %s", to_email, response.status_code)
+    log.info("Email sent to %s — status %s", to_email, response.status_code)
 
 # ---------------------------------------------------------------------------
-# Main polling loop
+# Polling loop
 # ---------------------------------------------------------------------------
 
 def run_poll():
-    """Check Canvas for completed students and send certs as needed."""
     log.info("--- Poll started at %s ---", datetime.utcnow().isoformat())
     try:
         course_name = get_course_name()
@@ -335,7 +314,7 @@ def run_poll():
             send_cert_email(email, name, course_name, pdf_bytes)
             record_sent(uid, CANVAS_COURSE_ID, email, name)
             sent_count += 1
-            time.sleep(1)  # small pause between emails
+            time.sleep(1)
 
         log.info("Poll complete. Sent %d new certificate(s).", sent_count)
 
@@ -343,40 +322,38 @@ def run_poll():
         log.exception("Poll failed: %s", e)
 
 def polling_loop():
-    """Background thread — runs once on startup, then every POLL_HOURS hours."""
     while True:
         run_poll()
         log.info("Next poll in %d hours.", POLL_HOURS)
         time.sleep(POLL_HOURS * 3600)
 
 # ---------------------------------------------------------------------------
-# Flask routes (for Railway health checks + manual controls)
+# Flask routes
 # ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "next_poll_hours": POLL_HOURS}), 200
+    return jsonify({"status": "ok", "poll_hours": POLL_HOURS}), 200
 
 @app.route("/poll", methods=["POST"])
 def manual_poll():
-    """Trigger a manual poll immediately — useful for testing."""
     thread = threading.Thread(target=run_poll, daemon=True)
     thread.start()
     return jsonify({"status": "poll started"}), 200
 
 @app.route("/log", methods=["GET"])
 def sent_log():
-    """See everyone who has been sent a certificate."""
     return jsonify(get_sent_log()), 200
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Startup — runs whether launched via gunicorn or directly
 # ---------------------------------------------------------------------------
+
 init_db()
 poll_thread = threading.Thread(target=polling_loop, daemon=True)
 poll_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    log.info("CertMailer polling every %d hours. Starting Flask on port %d.", POLL_HOURS, port)
+    log.info("CertMailer starting on port %d", port)
     app.run(host="0.0.0.0", port=port)
