@@ -43,7 +43,7 @@ MAILGUN_API_KEY = os.environ["MAILGUN_API_KEY"]
 MAILGUN_DOMAIN  = os.environ["MAILGUN_DOMAIN"]
 FROM_EMAIL      = os.environ["FROM_EMAIL"]
 WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")
-CERT_IMAGE_PATH = os.environ.get("CERT_IMAGE_PATH", "certificate_template.png")
+CERT_IMAGE_PATH = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
 
 # Name position on the certificate — adjust to match your template.
 # Values are percentages of image width/height (0.0 – 1.0).
