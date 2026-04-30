@@ -263,6 +263,8 @@ def generate_cert_pdf(student_name: str) -> bytes:
     if fit_h > page_h:
         fit_h = page_h
         fit_w = page_h * aspect
+    x_off = (page_w - fit_w) / 2
+    y_off = (page_h - fit_h) / 2
 
     img_buf = io.BytesIO()
     img.save(img_buf, format="JPEG", quality=95)
