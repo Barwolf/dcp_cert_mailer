@@ -29,9 +29,7 @@ import requests
 from flask import Flask, jsonify
 from PIL import Image, ImageDraw, ImageFont
 from reportlab.lib.pagesizes import landscape, A4
-from reportlab.platypus import SimpleDocTemplate
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import Image as RLImage
 
 # ---------------------------------------------------------------------------
 # Config
@@ -271,17 +269,10 @@ def generate_cert_pdf(student_name: str) -> bytes:
     img_buf.seek(0)
 
     pdf_buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        pdf_buf,
-        pagesize=landscape(A4),
-        leftMargin=0, rightMargin=0, topMargin=0, bottomMargin=0,
-    )
-    rl_img = RLImage(ImageReader(img_buf), width=fit_w, height=fit_h)
-    rl_img.hAlign = "CENTER"
-    doc.build(
-        [rl_img],
-        onFirstPage=lambda c, d: c.translate((page_w - fit_w) / 2, (page_h - fit_h) / 2),
-    )
+    from reportlab.pdfgen import canvas as rl_canvas
+    c = rl_canvas.Canvas(pdf_buf, pagesize=landscape(A4))
+    c.drawImage(ImageReader(img_buf), x_off, y_off, width=fit_w, height=fit_h)
+    c.save()
     return pdf_buf.getvalue()
 
 # ---------------------------------------------------------------------------
@@ -348,9 +339,14 @@ def run_poll():
 
 def polling_loop():
     while True:
-        run_poll()
-        log.info("Next poll in %d hours.", POLL_HOURS)
-        time.sleep(POLL_HOURS * 3600)
+        today = datetime.utcnow().day
+        if today == 19:
+            log.info("Today is the 19th — running poll.")
+            run_poll()
+        else:
+            log.info("Today is the %d — not the 19th, skipping poll.", today)
+        log.info("Sleeping 24 hours before next check.")
+        time.sleep(24 * 3600)
 
 # ---------------------------------------------------------------------------
 # Flask routes
