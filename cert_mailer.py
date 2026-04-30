@@ -139,7 +139,12 @@ def canvas_get_all(path: str, params: dict = None) -> list:
             timeout=15,
         )
         resp.raise_for_status()
-        results.extend(resp.json())
+        data = resp.json()
+        # Canvas sometimes returns a single dict instead of a list
+        if isinstance(data, list):
+            results.extend(data)
+        elif isinstance(data, dict):
+            results.append(data)
 
         next_params = {}
         url = None
