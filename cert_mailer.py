@@ -53,8 +53,8 @@ CERT_IMAGE_PATH  = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
 # Name position — adjust to match your certificate template.
 # Use the HTML tool to find the right X/Y percentages first.
 NAME_X_PCT  = 0.50
-NAME_Y_PCT  = 0.63   
-NAME_SIZE   = 80     
+NAME_Y_PCT  = 0.58
+NAME_SIZE   = 72
 NAME_COLOR  = (30, 26, 22)
 
 DB_PATH      = "cert_log.db"
@@ -129,16 +129,64 @@ def get_course_name() -> str:
     course = canvas_get(f"courses/{CANVAS_COURSE_ID}")
     return course.get("name", "your course")
 
+def get_all_modules() -> list:
+    """Return all modules in the course."""
+    modules = []
+    page = 1
+    while True:
+        batch = canvas_get(
+            f"courses/{CANVAS_COURSE_ID}/modules",
+            params={"per_page": 100, "page": page}
+        )
+        if not batch:
+            break
+        modules.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return modules
+
+def student_completed_all_modules(user_id: str, modules: list) -> bool:
+    """
+    Check if a student has completed all modules by looking at
+    each module's completion_requirement for that student.
+    Uses the include[]=student_completions param.
+    """
+    for module in modules:
+        module_id = module.get("id")
+        # Skip modules with no completion requirements
+        if not module.get("completion_requirements"):
+            continue
+        try:
+            detail = canvas_get(
+                f"courses/{CANVAS_COURSE_ID}/modules/{module_id}",
+                params={"student_id": user_id}
+            )
+            state = detail.get("state", "")
+            # state is 'completed' when all requirements in the module are done
+            if state != "completed":
+                return False
+        except requests.HTTPError:
+            return False
+    return True
+
 def get_completed_students() -> list:
     """
-    Returns a list of students who have completed all course requirements.
-    Uses the Canvas course completions endpoint.
+    Returns a list of students who have completed all course modules.
+    Uses module state per student, which is supported on UCI Canvas.
     """
     students = []
     page = 1
 
+    # Get all modules once upfront
+    modules = get_all_modules()
+    if not modules:
+        log.warning("No modules found for course %s — nothing to check.", CANVAS_COURSE_ID)
+        return []
+
+    log.info("Found %d module(s) to check.", len(modules))
+
     while True:
-        # Get all enrollments for the course
         enrollments = canvas_get(
             f"courses/{CANVAS_COURSE_ID}/enrollments",
             params={
@@ -156,22 +204,10 @@ def get_completed_students() -> list:
             user_id = enrollment.get("user_id")
             user    = enrollment.get("user", {})
             name    = user.get("name", "")
-            email   = user.get("login_id", "")  # usually their email at UCI
+            email   = user.get("login_id", "")
 
-            # Check completion via course progress
             try:
-                progress = canvas_get(f"courses/{CANVAS_COURSE_ID}/users/{user_id}/course_progress")
-                req_count     = progress.get("requirement_count", 0)
-                req_completed = progress.get("requirement_completed_count", 0)
-                completed_at  = progress.get("completed_at")
-
-                # Student is complete if all requirements are met
-                is_complete = (
-                    req_count > 0 and
-                    req_completed >= req_count
-                ) or completed_at is not None
-
-                if is_complete and name and email:
+                if student_completed_all_modules(str(user_id), modules) and name and email:
                     students.append({
                         "user_id": str(user_id),
                         "name":    name,
@@ -194,12 +230,10 @@ def get_completed_students() -> list:
 
 def load_font(size: int):
     candidates = [
-    "palatino.ttf",
-    "palab.ttf",
-    "pala.ttf",
-    "/usr/share/fonts/truetype/msttcorefonts/Palatino.ttf",
-    "/Library/Fonts/Palatino.ttc",
-    "georgia.ttf",   # fallback
+        "georgia.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Georgia.ttf",
+        "/Library/Fonts/Georgia.ttf",
+        "C:/Windows/Fonts/georgia.ttf",
     ]
     for path in candidates:
         if Path(path).exists():
@@ -339,14 +373,10 @@ def sent_log():
 # Entry point
 # ---------------------------------------------------------------------------
 init_db()
-
+poll_thread = threading.Thread(target=polling_loop, daemon=True)
+poll_thread.start()
 
 if __name__ == "__main__":
-
-    # Start the background polling thread
-    poll_thread = threading.Thread(target=polling_loop, daemon=True)
-    poll_thread.start()
-
     port = int(os.environ.get("PORT", 8080))
     log.info("CertMailer polling every %d hours. Starting Flask on port %d.", POLL_HOURS, port)
     app.run(host="0.0.0.0", port=port)
