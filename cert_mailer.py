@@ -338,9 +338,10 @@ def sent_log():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+init_db()
+
 
 if __name__ == "__main__":
-    init_db()
 
     # Start the background polling thread
     poll_thread = threading.Thread(target=polling_loop, daemon=True)
