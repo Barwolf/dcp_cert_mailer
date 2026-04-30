@@ -175,6 +175,12 @@ def get_passing_students() -> list:
         params={"include[]": "user"}
     )
 
+    log.info("Raw response has %d item(s). First item type: %s. Keys: %s",
+        len(raw),
+        type(raw[0]).__name__ if raw else "N/A",
+        list(raw[0].keys()) if raw and isinstance(raw[0], dict) else "N/A"
+    )
+
     submissions = []
     users_by_id = {}
     for item in raw:
@@ -182,8 +188,10 @@ def get_passing_students() -> list:
             submissions.extend(item.get("quiz_submissions", []))
             for u in item.get("users", []):
                 users_by_id[str(u["id"])] = u
-        elif isinstance(item, dict):
+        elif isinstance(item, dict) and "quiz_submissions" not in item:
             submissions.append(item)
+
+    log.info("After parsing: %d submission(s), %d user(s) in lookup.", len(submissions), len(users_by_id))
 
     log.info("Found %d submission(s) total.", len(submissions))
 
