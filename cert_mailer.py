@@ -1,13 +1,15 @@
 """
 CertMailer — Daily polling version
 ------------------------------------
-Checks Canvas once a day for newly completed students and emails them
-their certificate. No webhook or admin access required.
+Checks Canvas once a day for students who passed the final quiz
+and emails them their certificate automatically.
 
 Environment variables (set in Railway):
     CANVAS_URL          e.g. https://canvas.eee.uci.edu
     CANVAS_TOKEN        Canvas API token
-    CANVAS_COURSE_ID    Numeric course ID from the Canvas URL
+    CANVAS_COURSE_ID    e.g. 80782
+    CANVAS_QUIZ_ID      e.g. 424718
+    QUIZ_PASSING_SCORE  Minimum score to pass (e.g. 28 for 80% of 35pts)
     MAILGUN_API_KEY     Mailgun API key
     MAILGUN_DOMAIN      e.g. sandbox-abc123.mailgun.org
     FROM_EMAIL          Your verified sender email
@@ -35,13 +37,15 @@ from reportlab.platypus import Image as RLImage
 # Config
 # ---------------------------------------------------------------------------
 
-CANVAS_URL       = os.environ["CANVAS_URL"].rstrip("/")
-CANVAS_TOKEN     = os.environ["CANVAS_TOKEN"]
-CANVAS_COURSE_ID = os.environ["CANVAS_COURSE_ID"]
-MAILGUN_API_KEY  = os.environ["MAILGUN_API_KEY"]
-MAILGUN_DOMAIN   = os.environ["MAILGUN_DOMAIN"]
-FROM_EMAIL       = os.environ["FROM_EMAIL"]
-CERT_IMAGE_PATH  = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
+CANVAS_URL          = os.environ["CANVAS_URL"].rstrip("/")
+CANVAS_TOKEN        = os.environ["CANVAS_TOKEN"]
+CANVAS_COURSE_ID    = os.environ["CANVAS_COURSE_ID"]
+CANVAS_QUIZ_ID      = os.environ["CANVAS_QUIZ_ID"]
+QUIZ_PASSING_SCORE  = float(os.environ.get("QUIZ_PASSING_SCORE", "28"))
+MAILGUN_API_KEY     = os.environ["MAILGUN_API_KEY"]
+MAILGUN_DOMAIN      = os.environ["MAILGUN_DOMAIN"]
+FROM_EMAIL          = os.environ["FROM_EMAIL"]
+CERT_IMAGE_PATH     = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
 
 NAME_X_PCT  = 0.50
 NAME_Y_PCT  = 0.63
@@ -107,7 +111,7 @@ def get_sent_log() -> list:
 # ---------------------------------------------------------------------------
 
 def canvas_get(path: str, params: dict = None) -> dict:
-    """Single GET — for endpoints returning a single object (dict)."""
+    """Single GET for endpoints returning one object."""
     resp = requests.get(
         f"{CANVAS_URL}/api/v1/{path}",
         headers={"Authorization": f"Bearer {CANVAS_TOKEN}"},
@@ -119,7 +123,7 @@ def canvas_get(path: str, params: dict = None) -> dict:
 
 def canvas_get_all(path: str, params: dict = None) -> list:
     """
-    Paginated GET — follows Canvas Link header pagination to fetch all results.
+    Paginated GET — follows Canvas Link header pagination.
     UCI Canvas uses Link headers, not page= parameters.
     """
     results = []
@@ -137,7 +141,6 @@ def canvas_get_all(path: str, params: dict = None) -> list:
         resp.raise_for_status()
         results.extend(resp.json())
 
-        # After first request, next URL already has params encoded
         next_params = {}
         url = None
         for part in resp.headers.get("Link", "").split(","):
@@ -155,54 +158,52 @@ def get_course_name() -> str:
     course = canvas_get(f"courses/{CANVAS_COURSE_ID}")
     return course.get("name", "your course")
 
-def get_all_modules() -> list:
-    return canvas_get_all(f"courses/{CANVAS_COURSE_ID}/modules")
-
-def student_completed_all_modules(user_id: str, modules: list) -> bool:
-    """Returns True if the student has completed every module that has requirements."""
-    for module in modules:
-        module_id = module.get("id")
-        if not module.get("completion_requirements"):
-            continue  # skip modules with no requirements
-        try:
-            detail = canvas_get(
-                f"courses/{CANVAS_COURSE_ID}/modules/{module_id}",
-                params={"student_id": user_id}
-            )
-            if detail.get("state", "") != "completed":
-                return False
-        except requests.HTTPError:
-            return False
-    return True
-
-def get_completed_students() -> list:
-    """Returns all students who have completed all course modules."""
-    modules = get_all_modules()
-    if not modules:
-        log.warning("No modules found for course %s.", CANVAS_COURSE_ID)
-        return []
-    log.info("Found %d module(s) to check.", len(modules))
-
-    enrollments = canvas_get_all(
-        f"courses/{CANVAS_COURSE_ID}/enrollments",
-        params={"type[]": "StudentEnrollment", "state[]": "active"}
+def get_passing_students() -> list:
+    """
+    Fetch all quiz submissions for the final quiz and return students
+    who scored at or above QUIZ_PASSING_SCORE on their best attempt.
+    """
+    log.info(
+        "Checking quiz %s for submissions with score >= %.1f",
+        CANVAS_QUIZ_ID, QUIZ_PASSING_SCORE
     )
-    log.info("Checking %d enrolled student(s).", len(enrollments))
 
-    students = []
-    for enrollment in enrollments:
-        user_id = enrollment.get("user_id")
-        user    = enrollment.get("user", {})
-        name    = user.get("name", "")
-        email   = user.get("login_id", "")
-        try:
-            if name and email and student_completed_all_modules(str(user_id), modules):
-                students.append({"user_id": str(user_id), "name": name, "email": email})
-                log.info("Completed: %s", name)
-        except Exception as e:
-            log.warning("Could not check user %s: %s", user_id, e)
+    submissions = canvas_get_all(
+        f"courses/{CANVAS_COURSE_ID}/quizzes/{CANVAS_QUIZ_ID}/submissions",
+        params={"include[]": "user"}
+    )
 
-    return students
+    log.info("Found %d submission(s) total.", len(submissions))
+
+    passing = []
+    for sub in submissions:
+        # Each submission may have multiple attempts — use the highest score
+        score     = sub.get("kept_score")   # Canvas keeps the best score by default
+        if score is None:
+            score = sub.get("score", 0)
+
+        user      = sub.get("user", {})
+        user_id   = str(sub.get("user_id", ""))
+        name      = user.get("name", "")
+        email     = user.get("login_id", "")  # UCI login_id is their email
+        workflow  = sub.get("workflow_state", "")
+
+        log.info(
+            "Student: %s | Score: %s | State: %s",
+            name, score, workflow
+        )
+
+        # Must be submitted (not just started) and score at or above threshold
+        if workflow in ("complete", "pending_review") and score is not None and float(score) >= QUIZ_PASSING_SCORE:
+            if name and email:
+                passing.append({
+                    "user_id": user_id,
+                    "name":    name,
+                    "email":   email,
+                    "score":   score,
+                })
+
+    return passing
 
 # ---------------------------------------------------------------------------
 # Certificate generation
@@ -296,20 +297,21 @@ def run_poll():
         course_name = get_course_name()
         log.info("Course: %s", course_name)
 
-        completed = get_completed_students()
-        log.info("Found %d completed student(s).", len(completed))
+        passing = get_passing_students()
+        log.info("Found %d student(s) who passed the quiz.", len(passing))
 
         sent_count = 0
-        for student in completed:
+        for student in passing:
             uid   = student["user_id"]
             name  = student["name"]
             email = student["email"]
+            score = student["score"]
 
             if already_sent(uid, CANVAS_COURSE_ID):
                 log.info("Already sent to %s — skipping.", name)
                 continue
 
-            log.info("Generating certificate for %s (%s)...", name, email)
+            log.info("Generating certificate for %s (score: %s)...", name, score)
             pdf_bytes = generate_cert_pdf(name)
             send_cert_email(email, name, course_name, pdf_bytes)
             record_sent(uid, CANVAS_COURSE_ID, email, name)
@@ -346,7 +348,7 @@ def sent_log():
     return jsonify(get_sent_log()), 200
 
 # ---------------------------------------------------------------------------
-# Startup — runs whether launched via gunicorn or directly
+# Startup
 # ---------------------------------------------------------------------------
 
 init_db()
