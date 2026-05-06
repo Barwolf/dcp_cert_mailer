@@ -1,57 +1,45 @@
 """
-CertMailer — Daily polling version
-------------------------------------
-Checks Canvas once a day for students who passed the final quiz
-and emails them their certificate automatically.
+CertMailer — Web version
+-------------------------
+Students enter their UCI NetID to check if they passed the final quiz
+and download their certificate.
 
-Environment variables (set in Railway):
+Environment variables:
     CANVAS_URL          e.g. https://canvas.eee.uci.edu
     CANVAS_TOKEN        Canvas API token
     CANVAS_COURSE_ID    e.g. 80782
     CANVAS_QUIZ_ID      e.g. 424718
     QUIZ_PASSING_SCORE  Minimum score to pass (e.g. 28 for 80% of 35pts)
-    MAILGUN_API_KEY     Mailgun API key
-    MAILGUN_DOMAIN      e.g. sandbox-abc123.mailgun.org
-    FROM_EMAIL          Your verified sender email
     CERT_IMAGE_PATH     e.g. VCA_Cert_2026.png
 """
 
-import os
 import io
 import logging
-import sqlite3
-import time
-import threading
-from datetime import datetime
+import os
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string, request, send_file
 from PIL import Image, ImageDraw, ImageFont
 from reportlab.lib.pagesizes import landscape, A4
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas as rl_canvas
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-CANVAS_URL          = os.environ["CANVAS_URL"].rstrip("/")
-CANVAS_TOKEN        = os.environ["CANVAS_TOKEN"]
-CANVAS_COURSE_ID    = os.environ["CANVAS_COURSE_ID"]
-CANVAS_QUIZ_ID      = os.environ["CANVAS_QUIZ_ID"]
-QUIZ_PASSING_SCORE  = float(os.environ.get("QUIZ_PASSING_SCORE", "28"))
-MAILGUN_API_KEY     = os.environ["MAILGUN_API_KEY"]
-MAILGUN_DOMAIN      = os.environ["MAILGUN_DOMAIN"]
-FROM_EMAIL          = os.environ["FROM_EMAIL"]
-CERT_IMAGE_PATH     = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
+CANVAS_URL         = os.environ["CANVAS_URL"].rstrip("/")
+CANVAS_TOKEN       = os.environ["CANVAS_TOKEN"]
+CANVAS_COURSE_ID   = os.environ["CANVAS_COURSE_ID"]
+CANVAS_QUIZ_ID     = os.environ["CANVAS_QUIZ_ID"]
+QUIZ_PASSING_SCORE = float(os.environ.get("QUIZ_PASSING_SCORE", "28"))
+CERT_IMAGE_PATH    = os.environ.get("CERT_IMAGE_PATH", "VCA_Cert_2026.png")
 
 NAME_X_PCT  = 0.50
 NAME_Y_PCT  = 0.63
 NAME_SIZE   = 80
 NAME_COLOR  = (30, 26, 22)
-
-DB_PATH    = "cert_log.db"
-POLL_HOURS = 24
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -59,50 +47,178 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Database
+# HTML
 # ---------------------------------------------------------------------------
 
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS sent_certs (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   TEXT NOT NULL,
-            course_id TEXT NOT NULL,
-            email     TEXT NOT NULL,
-            name      TEXT NOT NULL,
-            sent_at   TEXT NOT NULL,
-            UNIQUE(user_id, course_id)
-        )
-    """)
-    con.commit()
-    con.close()
+PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Certificate Download</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0,0,0,.10);
+      padding: 2.5rem 2rem;
+      width: 100%;
+      max-width: 440px;
+      text-align: center;
+    }
+    .logo { font-size: 2.5rem; margin-bottom: .75rem; }
+    h1 { font-size: 1.4rem; color: #1a1a2e; margin-bottom: .4rem; }
+    p.sub { color: #666; font-size: .95rem; margin-bottom: 1.75rem; line-height: 1.5; }
+    label { display: block; text-align: left; font-size: .85rem; font-weight: 600;
+            color: #444; margin-bottom: .4rem; }
+    .input-row {
+      display: flex;
+      gap: .5rem;
+      margin-bottom: 1.25rem;
+    }
+    input[type=text] {
+      flex: 1;
+      padding: .65rem .9rem;
+      border: 1.5px solid #d0d5dd;
+      border-radius: 8px;
+      font-size: 1rem;
+      outline: none;
+      transition: border-color .2s;
+    }
+    input[type=text]:focus { border-color: #0064a4; }
+    .suffix {
+      display: flex;
+      align-items: center;
+      padding: 0 .75rem;
+      background: #f0f4f8;
+      border: 1.5px solid #d0d5dd;
+      border-radius: 8px;
+      font-size: .95rem;
+      color: #666;
+      white-space: nowrap;
+    }
+    button {
+      width: 100%;
+      padding: .75rem;
+      background: #0064a4;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    button:hover { background: #004f83; }
+    button:disabled { background: #8ab4cf; cursor: not-allowed; }
+    .msg {
+      margin-top: 1.25rem;
+      padding: .85rem 1rem;
+      border-radius: 8px;
+      font-size: .95rem;
+      display: none;
+    }
+    .msg.error   { background: #fff0f0; color: #c0392b; border: 1px solid #f5c6cb; }
+    .msg.success { background: #edfaf1; color: #1a7f4b; border: 1px solid #b7e4c7; }
+    .spinner {
+      display: none;
+      margin: .75rem auto 0;
+      width: 24px; height: 24px;
+      border: 3px solid #d0d5dd;
+      border-top-color: #0064a4;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🎓</div>
+    <h1>Course Certificate</h1>
+    <p class="sub">Enter your UCI NetID below to check your quiz score and download your certificate.</p>
 
-def already_sent(user_id: str, course_id: str) -> bool:
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute(
-        "SELECT 1 FROM sent_certs WHERE user_id=? AND course_id=?",
-        (str(user_id), str(course_id))
-    ).fetchone()
-    con.close()
-    return row is not None
+    <label for="netid">UCI NetID</label>
+    <div class="input-row">
+      <input type="text" id="netid" placeholder="e.g. jsmith" autocomplete="off" spellcheck="false">
+      <div class="suffix">@uci.edu</div>
+    </div>
 
-def record_sent(user_id: str, course_id: str, email: str, name: str):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT OR IGNORE INTO sent_certs (user_id, course_id, email, name, sent_at) VALUES (?,?,?,?,?)",
-        (str(user_id), str(course_id), email, name, datetime.utcnow().isoformat())
-    )
-    con.commit()
-    con.close()
+    <button id="btn" onclick="checkCert()">Check &amp; Download</button>
+    <div class="spinner" id="spinner"></div>
+    <div class="msg" id="msg"></div>
+  </div>
 
-def get_sent_log() -> list:
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        "SELECT name, email, sent_at FROM sent_certs ORDER BY sent_at DESC"
-    ).fetchall()
-    con.close()
-    return [{"name": r[0], "email": r[1], "sent_at": r[2]} for r in rows]
+  <script>
+    document.getElementById('netid').addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') checkCert();
+    });
+
+    async function checkCert() {
+      const netid = document.getElementById('netid').value.trim();
+      const btn   = document.getElementById('btn');
+      const msg   = document.getElementById('msg');
+      const spin  = document.getElementById('spinner');
+
+      msg.style.display = 'none';
+
+      if (!netid) {
+        showMsg('error', 'Please enter your NetID.');
+        return;
+      }
+
+      btn.disabled = true;
+      spin.style.display = 'block';
+
+      try {
+        const resp = await fetch('/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ netid })
+        });
+
+        if (resp.ok && resp.headers.get('content-type') === 'application/pdf') {
+          const blob = await resp.blob();
+          const url  = URL.createObjectURL(blob);
+          const a    = document.createElement('a');
+          a.href     = url;
+          a.download = 'certificate.pdf';
+          a.click();
+          URL.revokeObjectURL(url);
+          showMsg('success', 'Your certificate is downloading!');
+        } else {
+          const data = await resp.json();
+          showMsg('error', data.error || 'Something went wrong. Please try again.');
+        }
+      } catch (err) {
+        showMsg('error', 'Network error. Please try again.');
+      } finally {
+        btn.disabled = false;
+        spin.style.display = 'none';
+      }
+    }
+
+    function showMsg(type, text) {
+      const msg = document.getElementById('msg');
+      msg.className = 'msg ' + type;
+      msg.textContent = text;
+      msg.style.display = 'block';
+    }
+  </script>
+</body>
+</html>
+"""
 
 # ---------------------------------------------------------------------------
 # Canvas API helpers
@@ -138,7 +254,6 @@ def canvas_get_all(path: str, params: dict = None) -> list:
         )
         resp.raise_for_status()
         data = resp.json()
-        # Canvas sometimes returns a single dict instead of a list
         if isinstance(data, list):
             results.extend(data)
         elif isinstance(data, dict):
@@ -161,27 +276,17 @@ def get_course_name() -> str:
     course = canvas_get(f"courses/{CANVAS_COURSE_ID}")
     return course.get("name", "your course")
 
-def get_passing_students() -> list:
+def find_student_submission(netid: str) -> dict | None:
     """
-    Fetch all quiz submissions for the final quiz and return students
-    who scored at or above QUIZ_PASSING_SCORE on their best attempt.
+    Return the submission dict for the given NetID if they passed, else None.
+    Matches login_id against 'netid' or 'netid@uci.edu'.
     """
-    log.info(
-        "Checking quiz %s for submissions with score >= %.1f",
-        CANVAS_QUIZ_ID, QUIZ_PASSING_SCORE
-    )
+    netid = netid.lower().strip()
+    login_variants = {netid, f"{netid}@uci.edu"}
 
-    # Canvas quiz submissions endpoint returns a wrapper dict with
-    # quiz_submissions + users keys. Flatten them out.
     raw = canvas_get_all(
         f"courses/{CANVAS_COURSE_ID}/quizzes/{CANVAS_QUIZ_ID}/submissions",
         params={"include[]": "user"}
-    )
-
-    log.info("Raw response has %d item(s). First item type: %s. Keys: %s",
-        len(raw),
-        type(raw[0]).__name__ if raw else "N/A",
-        list(raw[0].keys()) if raw and isinstance(raw[0], dict) else "N/A"
     )
 
     submissions = []
@@ -194,37 +299,32 @@ def get_passing_students() -> list:
         elif isinstance(item, dict) and "quiz_submissions" not in item:
             submissions.append(item)
 
-    log.info("After parsing: %d submission(s), %d user(s) in lookup.", len(submissions), len(users_by_id))
-
-    log.info("Found %d submission(s) total.", len(submissions))
-
-    passing = []
     for sub in submissions:
         if not isinstance(sub, dict):
-            log.warning("Skipping unexpected type: %s", type(sub))
             continue
 
         uid_str  = str(sub.get("user_id", ""))
         user     = sub.get("user") or users_by_id.get(uid_str, {})
+        login_id = user.get("login_id", "").lower()
+
+        if login_id not in login_variants:
+            continue
+
         score    = sub.get("kept_score")
         if score is None:
             score = sub.get("score", 0)
-        name     = user.get("name", "")
-        email    = user.get("login_id", "")
         workflow = sub.get("workflow_state", "")
+        name     = user.get("name", "")
 
-        log.info("Student: %s | Score: %s | State: %s", name, score, workflow)
+        log.info("Found submission for %s — score: %s, state: %s", login_id, score, workflow)
 
-        if workflow in ("complete", "pending_review") and score is not None and float(score) >= QUIZ_PASSING_SCORE:
-            if name and email:
-                passing.append({
-                    "user_id": uid_str,
-                    "name":    name,
-                    "email":   email,
-                    "score":   score,
-                })
+        if workflow in ("complete", "pending_review") and float(score) >= QUIZ_PASSING_SCORE:
+            return {"name": name, "score": score}
 
-    return passing
+        # Found them but didn't pass
+        return {"name": name, "score": score, "failed": True}
+
+    return None  # not found at all
 
 # ---------------------------------------------------------------------------
 # Certificate generation
@@ -240,7 +340,7 @@ def load_font(size: int):
     for path in candidates:
         if Path(path).exists():
             return ImageFont.truetype(path, size)
-    log.warning("No font file found — using PIL default. Add palatino.ttf to your repo.")
+    log.warning("No font file found — using PIL default. Add palatino.ttf or georgia.ttf to the repo.")
     return ImageFont.load_default()
 
 def generate_cert_pdf(student_name: str) -> bytes:
@@ -271,110 +371,66 @@ def generate_cert_pdf(student_name: str) -> bytes:
     img_buf.seek(0)
 
     pdf_buf = io.BytesIO()
-    from reportlab.pdfgen import canvas as rl_canvas
     c = rl_canvas.Canvas(pdf_buf, pagesize=landscape(A4))
     c.drawImage(ImageReader(img_buf), x_off, y_off, width=fit_w, height=fit_h)
     c.save()
     return pdf_buf.getvalue()
 
 # ---------------------------------------------------------------------------
-# Email
+# Routes
 # ---------------------------------------------------------------------------
 
-def send_cert_email(to_email: str, student_name: str, course_name: str, pdf_bytes: bytes):
-    filename = f"certificate_{student_name.replace(' ', '_')}.pdf"
-    response = requests.post(
-        f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
-        auth=("api", MAILGUN_API_KEY),
-        data={
-            "from":    f"Course Certificates <{FROM_EMAIL}>",
-            "to":      to_email,
-            "subject": f"Congratulations! Your certificate for {course_name}",
-            "html":    f"""
-                <p>Hi {student_name},</p>
-                <p>Congratulations on completing <strong>{course_name}</strong>!</p>
-                <p>Please find your certificate attached to this email.</p>
-                <p>Well done!</p>
-            """,
-        },
-        files=[("attachment", (filename, pdf_bytes, "application/pdf"))],
-        timeout=15,
-    )
-    response.raise_for_status()
-    log.info("Email sent to %s — status %s", to_email, response.status_code)
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(PAGE)
 
-# ---------------------------------------------------------------------------
-# Polling loop
-# ---------------------------------------------------------------------------
+@app.route("/check", methods=["POST"])
+def check():
+    data  = request.get_json(force=True, silent=True) or {}
+    netid = (data.get("netid") or "").strip()
 
-def run_poll():
-    log.info("--- Poll started at %s ---", datetime.utcnow().isoformat())
+    if not netid:
+        return jsonify({"error": "Please enter your NetID."}), 400
+
+    log.info("Check request for NetID: %s", netid)
+
     try:
-        course_name = get_course_name()
-        log.info("Course: %s", course_name)
-
-        passing = get_passing_students()
-        log.info("Found %d student(s) who passed the quiz.", len(passing))
-
-        sent_count = 0
-        for student in passing:
-            uid   = student["user_id"]
-            name  = student["name"]
-            email = student["email"]
-            score = student["score"]
-
-            if already_sent(uid, CANVAS_COURSE_ID):
-                log.info("Already sent to %s — skipping.", name)
-                continue
-
-            log.info("Generating certificate for %s (score: %s)...", name, score)
-            pdf_bytes = generate_cert_pdf(name)
-            send_cert_email(email, name, course_name, pdf_bytes)
-            record_sent(uid, CANVAS_COURSE_ID, email, name)
-            sent_count += 1
-            time.sleep(1)
-
-        log.info("Poll complete. Sent %d new certificate(s).", sent_count)
-
+        result = find_student_submission(netid)
+    except requests.HTTPError as e:
+        log.exception("Canvas API error: %s", e)
+        return jsonify({"error": "Could not reach Canvas. Please try again later."}), 502
     except Exception as e:
-        log.exception("Poll failed: %s", e)
+        log.exception("Unexpected error: %s", e)
+        return jsonify({"error": "Something went wrong. Please try again."}), 500
 
-def polling_loop():
-    while True:
-        today = datetime.utcnow().day
-        if today == 19:
-            log.info("Today is the 19th — running poll.")
-            run_poll()
-        else:
-            log.info("Today is the %d — not the 19th, skipping poll.", today)
-        log.info("Sleeping 24 hours before next check.")
-        time.sleep(24 * 3600)
+    if result is None:
+        return jsonify({"error": "No quiz submission found for that NetID. Make sure you've completed the quiz."}), 404
 
-# ---------------------------------------------------------------------------
-# Flask routes
-# ---------------------------------------------------------------------------
+    if result.get("failed"):
+        score = result["score"]
+        return jsonify({"error": f"Your score ({score}) did not meet the passing threshold. Please retake the quiz."}), 403
+
+    try:
+        pdf_bytes = generate_cert_pdf(result["name"])
+    except Exception as e:
+        log.exception("PDF generation failed: %s", e)
+        return jsonify({"error": "Certificate generation failed. Please contact your instructor."}), 500
+
+    filename = f"certificate_{result['name'].replace(' ', '_')}.pdf"
+    return send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "poll_hours": POLL_HOURS}), 200
-
-@app.route("/poll", methods=["POST"])
-def manual_poll():
-    thread = threading.Thread(target=run_poll, daemon=True)
-    thread.start()
-    return jsonify({"status": "poll started"}), 200
-
-@app.route("/log", methods=["GET"])
-def sent_log():
-    return jsonify(get_sent_log()), 200
+    return jsonify({"status": "ok"}), 200
 
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
-
-init_db()
-poll_thread = threading.Thread(target=polling_loop, daemon=True)
-poll_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
